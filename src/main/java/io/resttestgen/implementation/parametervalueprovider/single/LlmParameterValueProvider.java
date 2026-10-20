@@ -38,7 +38,15 @@ public class LlmParameterValueProvider extends CountableParameterValueProvider {
     private LinkedTreeMap<String, LinkedTreeMap<String, ArrayList<Object>>> llmDictionary;
 
     private final Gson gson;
-    private final boolean ENABLE_LLM = false; // Configure your LLM below to use it!!
+    private final boolean ENABLE_LLM = true; // RESTgym: the LLM is served by Ollama inside the tool container
+    // RESTgym: Ollama in the tool container (restgym-entrypoint.sh starts it and loads the model on the GPU)
+    private static final String LLM_BASE_URL = "http://127.0.0.1:11434/v1";
+    private static final String LLM_MODEL_NAME = "qwen3-8b"; // qwen3:8b, with as many threads as the CPUs of the container (restgym-entrypoint.sh)
+    // RESTgym: maximum number of requests to the LLM for each parameter of each operation. If the LLM did not provide
+    // enough values compliant with the parameter within these requests, it is considered to have no (more) values for
+    // it, and it is not asked again (otherwise, it would be asked again for every request that uses the parameter)
+    private static final int MAX_LLM_REQUESTS_PER_PARAMETER = 5;
+    private final Map<String, Integer> llmRequestsPerParameter = new HashMap<>();
     private final String SYSTEM_PROMPT = "You are a REST API testing assistant that has to generate example values for HTTP parameters and JSON properties in the body of requests. I am only interested in values. Each time I will tell you the method, the endpoint of a REST operation, the parameter name, and the parameter type (string, number, etc.), and you have to provide 25 example values for it. 20 of these values should be nominal values that have to be accepted as valid by the API. 5 of these values should be peculiar, e.g., corner cases, strange symbols, etc., but still in the requested format. I expect the response to be a JSON array in this format: [\"value1\", \"value2\", ...]. Do not use MD, only raw JSON.";
     private final boolean STORE_NEW_VALUES_TO_DICTIONARY_FILE = true;
     private final String DICTIONARY_PATH = Environment.getInstance().getApiUnderTest().getDir() + "/dictionaries/llm.json";
@@ -88,8 +96,12 @@ public class LlmParameterValueProvider extends CountableParameterValueProvider {
             return llmDictionaryValues;
         }
 
-        // Proceed with generation only if an LLM is available (configured and reachable)
-        if (ENABLE_LLM) {
+        // Proceed with generation only if an LLM is available (configured and reachable), and if it was not already asked
+        // MAX_LLM_REQUESTS_PER_PARAMETER times for this parameter
+        String parameterKey = leafParameter.getOperation().toString() + " " + leafParameter.getName().toString();
+        int llmRequests = llmRequestsPerParameter.getOrDefault(parameterKey, 0);
+        if (ENABLE_LLM && llmRequests < MAX_LLM_REQUESTS_PER_PARAMETER) {
+            llmRequestsPerParameter.put(parameterKey, llmRequests + 1);
 
             // Ask LLM
             List<Object> llmValues = promptLlmForValues(leafParameter);
@@ -114,6 +126,11 @@ public class LlmParameterValueProvider extends CountableParameterValueProvider {
 
         // Get updated values from dictionary after LLM filled it
         llmDictionaryValues = getValuesFromLlmDictionary(leafParameter);
+
+        if (ENABLE_LLM && llmRequests + 1 == MAX_LLM_REQUESTS_PER_PARAMETER && llmDictionaryValues.size() <= 5) {
+            logger.info("The LLM has no (more) values for '{}' in operation {} after {} requests: it will not be asked again ({} compliant values).",
+                    leafParameter.getName(), leafParameter.getOperation(), MAX_LLM_REQUESTS_PER_PARAMETER, llmDictionaryValues.size());
+        }
 
         // Fallback to an empty list of values
         return llmDictionaryValues;
@@ -171,18 +188,29 @@ public class LlmParameterValueProvider extends CountableParameterValueProvider {
         ChatModel model = OpenAiChatModel.builder()
                 .httpClientBuilder(jdkHttpClientBuilder)
                 .timeout(Duration.ofMinutes(10))
-                .baseUrl("http://localhost:1234/v1")
+                .baseUrl(LLM_BASE_URL)
                 .apiKey("demo")
-                .modelName("qwen3-14b-mlx")
+                .modelName(LLM_MODEL_NAME)
                 .build();
 
         logger.info("Asking LLM for a parameter value for '{}' in operation {}.", leafParameter.getName(), leafParameter.getOperation());
 
-        // Chat with the model
-        String answer = model.chat(
-                SystemMessage.from(SYSTEM_PROMPT),
-                UserMessage.from(prompt.toString())
-        ).aiMessage().text();
+        // Chat with the model. RESTgym: a failed request (e.g., a timeout) counts as a request without values, instead
+        // of stopping the testing session
+        String answer;
+        try {
+            answer = model.chat(
+                    SystemMessage.from(SYSTEM_PROMPT),
+                    UserMessage.from(prompt.toString())
+            ).aiMessage().text();
+        } catch (RuntimeException e) {
+            logger.warn("The request to the LLM failed: {}", e.getMessage());
+            return List.of();
+        }
+        if (answer == null) {
+            logger.warn("The LLM returned no answer.");
+            return List.of();
+        }
 
         // Remove reasoning (<think>) and trim answer
         String cleanAnswer = answer.replaceAll("(?s)<think>.*?</think>", "").trim();
